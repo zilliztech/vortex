@@ -48,6 +48,8 @@ pub struct VortexOpenOptions {
     segment_cache: Option<Arc<dyn SegmentCache>>,
     /// The number of bytes to read when parsing the footer.
     initial_read_size: usize,
+    /// Whether to cache segments covered by the initial footer read.
+    cache_initial_read: bool,
     /// An optional, externally provided, file size.
     file_size: Option<u64>,
     /// An optional, externally provided, DType.
@@ -73,6 +75,7 @@ pub trait OpenOptionsSessionExt:
             session: self.session(),
             segment_cache: None,
             initial_read_size: INITIAL_READ_SIZE,
+            cache_initial_read: true,
             file_size: None,
             dtype: None,
             footer: None,
@@ -92,6 +95,15 @@ impl VortexOpenOptions {
     /// Configure the initial read size for the Vortex file.
     pub fn with_initial_read_size(mut self, initial_read_size: usize) -> Self {
         self.initial_read_size = initial_read_size;
+        self
+    }
+
+    /// Configure whether to cache segments covered by the initial footer read.
+    ///
+    /// This is enabled by default. Disable it for sparse sources whose missing ranges may be
+    /// populated after the file is opened.
+    pub fn with_initial_read_cache(mut self, cache_initial_read: bool) -> Self {
+        self.cache_initial_read = cache_initial_read;
         self
     }
 
@@ -302,10 +314,12 @@ impl VortexOpenOptions {
             }
         }?;
 
-        // If the initial read happened to cover any segments, then we can populate the
-        // segment cache
-        let initial_offset = file_size - (deserializer.buffer().len() as u64);
-        self.populate_initial_segments(initial_offset, deserializer.buffer(), &footer);
+        if self.cache_initial_read {
+            // If the initial read happened to cover any segments, then we can populate the
+            // segment cache
+            let initial_offset = file_size - (deserializer.buffer().len() as u64);
+            self.populate_initial_segments(initial_offset, deserializer.buffer(), &footer);
+        }
 
         Ok(footer)
     }
@@ -484,6 +498,58 @@ mod tests {
         );
         let read = total_read.load(Ordering::Relaxed);
         assert!(read < 1024 * 1024, "Read {} bytes, expected < 1MB", read);
+    }
+
+    #[tokio::test]
+    async fn test_initial_read_cache_can_be_disabled() -> VortexResult<()> {
+        let session = VortexSession::empty()
+            .with::<DTypeSession>()
+            .with::<ArraySession>()
+            .with::<LayoutSession>()
+            .with::<ScalarFnSession>()
+            .with::<RuntimeSession>();
+
+        crate::register_default_encodings(&session);
+
+        let mut buf = ByteBufferMut::empty();
+        let array = Buffer::from((0i32..16).collect::<Vec<_>>()).into_array();
+        session
+            .write_options()
+            .write(&mut buf, array.to_array_stream())
+            .await?;
+        let buffer = ByteBuffer::from(buf);
+
+        let total_read = Arc::new(AtomicUsize::new(0));
+        let file = session
+            .open_options()
+            .with_initial_read_size(buffer.len())
+            .open_read(CountingRead {
+                inner: buffer.clone(),
+                total_read: Arc::clone(&total_read),
+                first_read_len: Arc::new(AtomicUsize::new(0)),
+            })
+            .await?;
+        assert!(!file.footer().segment_map().is_empty());
+        let read_after_open = total_read.load(Ordering::Relaxed);
+        file.segment_source().request(SegmentId::from(0)).await?;
+        assert_eq!(total_read.load(Ordering::Relaxed), read_after_open);
+
+        let total_read = Arc::new(AtomicUsize::new(0));
+        let file = session
+            .open_options()
+            .with_initial_read_size(buffer.len())
+            .with_initial_read_cache(false)
+            .open_read(CountingRead {
+                inner: buffer,
+                total_read: Arc::clone(&total_read),
+                first_read_len: Arc::new(AtomicUsize::new(0)),
+            })
+            .await?;
+        let read_after_open = total_read.load(Ordering::Relaxed);
+        file.segment_source().request(SegmentId::from(0)).await?;
+        assert!(total_read.load(Ordering::Relaxed) > read_after_open);
+
+        Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
